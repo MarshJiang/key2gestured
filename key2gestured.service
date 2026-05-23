@@ -1,0 +1,40 @@
+# key2gestured — Android-style gesture scrolling for BlackBerry KEY2
+# Copyright (C) 2026 Marsh Jiang
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+[Unit]
+Description=KEY2 Gesture Daemon
+Documentation=https://github.com/MarshJiang/key2gestured
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/key2gestured
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+
+# Must run as root to access /dev/input event devices and /dev/uinput.
+User=root
+
+# Security hardening — NOT using ProtectSystem=strict or
+# ProtectKernelTunables=yes, because uinput UI_DEV_CREATE
+# needs write access to sysfs to register the device.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=graphical-session.target
