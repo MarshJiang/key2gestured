@@ -25,6 +25,7 @@
 #include <math.h>
 #include <time.h>
 #include <string.h>
+#include <signal.h>
 
 #include <linux/input.h>
 #include <libevdev/libevdev.h>
@@ -35,8 +36,8 @@
 /*
  * Device paths
  */
-#define TOUCH_DEVICE   "/dev/input/by-path/platform-c175000.i2c-event"
-#define KEYBOARD_DEVICE "/dev/input/event2"
+#define DEFAULT_TOUCH_DEVICE   "/dev/input/by-path/platform-c175000.i2c-event"
+#define DEFAULT_KEYBOARD_DEVICE "/dev/input/event2"
 
 /*
  * Global state
@@ -49,6 +50,9 @@ long long last_key_time_ms = 0;
 static int current_slot = 0;
 static int keyboard_fd = -1;
 static struct libevdev *keyboard_dev = NULL;
+static volatile sig_atomic_t running = 1;
+static const char *touch_device_path = DEFAULT_TOUCH_DEVICE;
+static const char *keyboard_device_path = DEFAULT_KEYBOARD_DEVICE;
 
 /* Momentum state */
 static float momentum_vx = 0.0f;
@@ -71,6 +75,7 @@ static int prev_x = 0;
 static float velocity_samples_x[VELOCITY_SAMPLES] = {0};
 static float velocity_samples_y[VELOCITY_SAMPLES] = {0};
 static int velocity_idx = 0;
+static int velocity_count = 0;
 
 /* ─── Time helpers ─── */
 
@@ -99,6 +104,11 @@ static void reset_all_fingers(void)
         reset_finger(i);
 }
 
+static int slot_is_valid(int slot)
+{
+    return slot >= 0 && slot < MAX_FINGERS;
+}
+
 /* ─── Velocity tracking ─── */
 
 static void record_velocity(int dx, int dy)
@@ -106,31 +116,57 @@ static void record_velocity(int dx, int dy)
     velocity_samples_x[velocity_idx] = (float)dx;
     velocity_samples_y[velocity_idx] = (float)dy;
     velocity_idx = (velocity_idx + 1) % VELOCITY_SAMPLES;
+    if (velocity_count < VELOCITY_SAMPLES)
+        velocity_count++;
 }
 
 static float average_velocity_x(void)
 {
+    if (velocity_count == 0)
+        return 0.0f;
+
     float sum = 0.0f;
-    for (int i = 0; i < VELOCITY_SAMPLES; i++)
+    for (int i = 0; i < velocity_count; i++)
         sum += velocity_samples_x[i];
-    return sum / VELOCITY_SAMPLES;
+    return sum / velocity_count;
 }
 
 static float average_velocity_y(void)
 {
+    if (velocity_count == 0)
+        return 0.0f;
+
     float sum = 0.0f;
-    for (int i = 0; i < VELOCITY_SAMPLES; i++)
+    for (int i = 0; i < velocity_count; i++)
         sum += velocity_samples_y[i];
-    return sum / VELOCITY_SAMPLES;
+    return sum / velocity_count;
 }
 
 static void clear_velocity(void)
 {
     velocity_idx = 0;
+    velocity_count = 0;
     for (int i = 0; i < VELOCITY_SAMPLES; i++) {
         velocity_samples_x[i] = 0.0f;
         velocity_samples_y[i] = 0.0f;
     }
+}
+
+static void end_injected_touch(void)
+{
+    if (touch_injected) {
+        touch_inject_up();
+        touch_injected = 0;
+    }
+}
+
+static void cancel_scroll_state(const char *reason)
+{
+    end_injected_touch();
+    state = STATE_IDLE;
+    reset_all_fingers();
+    clear_velocity();
+    printf("%s\n", reason);
 }
 
 /* ─── Typing suppression ─── */
@@ -146,7 +182,7 @@ static int setup_keyboard(void)
     struct libevdev *dev = NULL;
     int fd;
 
-    fd = open(KEYBOARD_DEVICE, O_RDONLY | O_NONBLOCK);
+    fd = open(keyboard_device_path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         perror("open keyboard device");
         return -1;
@@ -159,6 +195,7 @@ static int setup_keyboard(void)
     }
 
     printf("Keyboard device: %s\n", libevdev_get_name(dev));
+    printf("  Path: %s\n", keyboard_device_path);
     keyboard_fd = fd;
     keyboard_dev = dev;
     return 0;
@@ -187,19 +224,42 @@ static void process_keyboard_events(void)
 
 /* ─── Gesture / scroll handling ─── */
 
-static void enter_scroll_active(int dy, int dx)
+static void inject_scroll_delta(int dx, int dy)
+{
+    if (dy > MAX_DELTA_PER_EVENT)
+        dy = MAX_DELTA_PER_EVENT;
+    else if (dy < -MAX_DELTA_PER_EVENT)
+        dy = -MAX_DELTA_PER_EVENT;
+
+    if (dx > MAX_DELTA_PER_EVENT)
+        dx = MAX_DELTA_PER_EVENT;
+    else if (dx < -MAX_DELTA_PER_EVENT)
+        dx = -MAX_DELTA_PER_EVENT;
+
+    record_velocity(dx, dy);
+    touch_inject_move(dx, dy);
+    touch_injected = 1;
+
+    total_dy += dy;
+    total_dx += dx;
+}
+
+static void enter_scroll_active(int new_x, int new_y, int dx, int dy)
 {
     printf("[SCROLL] Enter SCROLL_ACTIVE (dy=%d, dx=%d)\n", dy, dx);
 
     state = STATE_SCROLL_ACTIVE;
     total_dy = 0;
     total_dx = 0;
-    prev_y = 0;
-    prev_x = 0;
-    touch_injected = 0;
+    prev_y = new_y;
+    prev_x = new_x;
+    clear_velocity();
 
     /* Inject touch down at screen center */
     touch_inject_down();
+    touch_injected = 1;
+
+    inject_scroll_delta(dx, dy);
 }
 
 static void exit_scroll_active(void)
@@ -219,11 +279,9 @@ static void exit_scroll_active(void)
             momentum_last_step = 0;
         } else {
             /* No significant velocity, end touch */
-            if (touch_injected) {
-                touch_inject_up();
-                touch_injected = 0;
-            }
+            end_injected_touch();
             state = STATE_IDLE;
+            clear_velocity();
             printf("[IDLE] Scroll ended, no momentum\n");
         }
     }
@@ -242,8 +300,9 @@ static void process_scroll_motion(int new_y, int new_x)
         int abs_dy = abs(dy);
         int abs_dx = abs(dx);
 
-        if (abs_dy > SCROLL_THRESHOLD || abs_dx > SCROLL_THRESHOLD) {
-            enter_scroll_active(dy, dx);
+        if (abs_dy > SCROLL_THRESHOLD ||
+            abs_dx > HORIZONTAL_SCROLL_THRESHOLD) {
+            enter_scroll_active(new_x, new_y, dx, dy);
         } else {
             /* Check gesture timeout */
             long long elapsed = now_ms() - gesture_start_ms;
@@ -268,26 +327,7 @@ static void process_scroll_motion(int new_y, int new_x)
     int move_dy = new_y - prev_y;
     int move_dx = new_x - prev_x;
 
-    /* Cap to prevent massive jumps */
-    if (move_dy > MAX_DELTA_PER_EVENT)
-        move_dy = MAX_DELTA_PER_EVENT;
-    else if (move_dy < -MAX_DELTA_PER_EVENT)
-        move_dy = -MAX_DELTA_PER_EVENT;
-
-    if (move_dx > MAX_DELTA_PER_EVENT)
-        move_dx = MAX_DELTA_PER_EVENT;
-    else if (move_dx < -MAX_DELTA_PER_EVENT)
-        move_dx = -MAX_DELTA_PER_EVENT;
-
-    /* Record velocity for momentum */
-    record_velocity(move_dx, move_dy);
-
-    /* Inject the touch move */
-    touch_inject_move(move_dx, move_dy);
-    touch_injected = 1;
-
-    total_dy += move_dy;
-    total_dx += move_dx;
+    inject_scroll_delta(move_dx, move_dy);
     prev_y = new_y;
     prev_x = new_x;
 }
@@ -314,14 +354,7 @@ static void process_momentum(void)
 
         if (speed < MOMENTUM_MIN_VELOCITY) {
             /* Momentum exhausted */
-            if (touch_injected) {
-                touch_inject_up();
-                touch_injected = 0;
-            }
-            state = STATE_IDLE;
-            reset_all_fingers();
-            clear_velocity();
-            printf("[IDLE] Momentum decayed\n");
+            cancel_scroll_state("[IDLE] Momentum decayed");
             return;
         }
 
@@ -351,16 +384,9 @@ static void process_touch_event(struct input_event *ev)
         if (state == STATE_IDLE || state == STATE_ONE_FINGER_PENDING)
             return;
 
-        /* If scroll active, end it immediately on keyboard activity */
-        if (state == STATE_SCROLL_ACTIVE) {
-            if (touch_injected) {
-                touch_inject_up();
-                touch_injected = 0;
-            }
-            state = STATE_IDLE;
-            reset_all_fingers();
-            clear_velocity();
-            printf("[SUPPRESS] Scroll cancelled by typing\n");
+        /* If scroll active, end it immediately on keyboard activity. */
+        if (state == STATE_SCROLL_ACTIVE || state == STATE_MOMENTUM) {
+            cancel_scroll_state("[SUPPRESS] Scroll cancelled by typing");
             return;
         }
     }
@@ -368,10 +394,18 @@ static void process_touch_event(struct input_event *ev)
     switch (ev->code) {
 
     case ABS_MT_SLOT:
+        if (!slot_is_valid(ev->value)) {
+            fprintf(stderr, "Ignoring invalid touch slot %d\n", ev->value);
+            current_slot = -1;
+            break;
+        }
         current_slot = ev->value;
         break;
 
     case ABS_MT_TRACKING_ID:
+        if (!slot_is_valid(current_slot))
+            break;
+
         if (ev->value < 0) {
             /* Finger lifted */
             if (current_slot == 0) {
@@ -382,13 +416,7 @@ static void process_touch_event(struct input_event *ev)
             /* Finger touched */
             if (state == STATE_MOMENTUM) {
                 /* New touch during momentum: cancel momentum */
-                if (touch_injected) {
-                    touch_inject_up();
-                    touch_injected = 0;
-                }
-                state = STATE_IDLE;
-                reset_all_fingers();
-                clear_velocity();
+                cancel_scroll_state("[MOMENTUM] Cancelled by new touch");
             }
 
             fingers[current_slot].active = 1;
@@ -406,6 +434,9 @@ static void process_touch_event(struct input_event *ev)
         break;
 
     case ABS_MT_POSITION_X:
+        if (!slot_is_valid(current_slot))
+            break;
+
         fingers[current_slot].x = ev->value;
         if (fingers[current_slot].active &&
             fingers[current_slot].start_x == 0)
@@ -413,6 +444,9 @@ static void process_touch_event(struct input_event *ev)
         break;
 
     case ABS_MT_POSITION_Y:
+        if (!slot_is_valid(current_slot))
+            break;
+
         fingers[current_slot].y = ev->value;
         if (fingers[current_slot].active &&
             fingers[current_slot].start_y == 0)
@@ -447,7 +481,7 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
         nfds = 2;
     }
 
-    while (1) {
+    while (running) {
         int pret = poll(fds, nfds, 8); /* ~8ms timeout for momentum */
 
         if (pret < 0) {
@@ -460,6 +494,10 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
         /* Process keyboard events first (typing suppression) */
         if (nfds > 1 && (fds[1].revents & POLLIN)) {
             process_keyboard_events();
+            if (is_typing_active() &&
+                (state == STATE_SCROLL_ACTIVE || state == STATE_MOMENTUM)) {
+                cancel_scroll_state("[SUPPRESS] Scroll cancelled by typing");
+            }
         }
 
         /* Process touch events */
@@ -485,25 +523,50 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
             process_momentum();
         }
 
-        /* End gesture if finger lifted and we're still pending */
-        if (state == STATE_ONE_FINGER_PENDING &&
-            !fingers[0].active) {
-            state = STATE_IDLE;
+        if (state == STATE_ONE_FINGER_PENDING) {
+            long long elapsed = now_ms() - gesture_start_ms;
+
+            if (!fingers[0].active || elapsed > GESTURE_TIMEOUT_MS) {
+                state = STATE_IDLE;
+                reset_all_fingers();
+                clear_velocity();
+            }
         }
     }
+
+    end_injected_touch();
 }
 
 /* ─── Entry point ─── */
 
+static void handle_signal(int signum)
+{
+    (void)signum;
+    running = 0;
+}
+
 int main(void)
 {
     struct libevdev *touch_dev = NULL;
+    const char *env_touch_device;
+    const char *env_keyboard_device;
+
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    env_touch_device = getenv("KEY2GESTURED_TOUCH_DEVICE");
+    if (env_touch_device && env_touch_device[0] != '\0')
+        touch_device_path = env_touch_device;
+
+    env_keyboard_device = getenv("KEY2GESTURED_KEYBOARD_DEVICE");
+    if (env_keyboard_device && env_keyboard_device[0] != '\0')
+        keyboard_device_path = env_keyboard_device;
 
     printf("key2gestured v0.2 — Touch injection scrolling daemon\n");
     printf("====================================================\n\n");
 
     /* Open touch device */
-    int fd = open(TOUCH_DEVICE, O_RDONLY | O_NONBLOCK);
+    int fd = open(touch_device_path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         perror("open touch device");
         return 1;
@@ -516,7 +579,7 @@ int main(void)
     }
 
     printf("Touch device: %s\n", libevdev_get_name(touch_dev));
-    printf("  Path: %s\n", TOUCH_DEVICE);
+    printf("  Path: %s\n", touch_device_path);
 
     /* Grab the touch device exclusively */
     if (libevdev_grab(touch_dev, LIBEVDEV_GRAB) < 0) {

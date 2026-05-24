@@ -34,8 +34,14 @@
 /* Typing suppression window in ms */
 #define TYPING_COOLDOWN_MS 100
 
-/* Scroll activation threshold in device units */
+/* Vertical scroll activation threshold in device units */
 #define SCROLL_THRESHOLD 18
+
+/*
+ * Horizontal activation is intentionally higher because thumb swipes on the
+ * KEY2 keyboard often contain sideways noise before a real vertical drag.
+ */
+#define HORIZONTAL_SCROLL_THRESHOLD 36
 
 /* Gesture timeout: must complete within 800ms */
 #define GESTURE_TIMEOUT_MS 800

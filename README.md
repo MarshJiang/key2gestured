@@ -55,6 +55,21 @@ MOMENTUM ──new touch──→ SCROLL_ACTIVE
 make
 ```
 
+For Droidian KEY2 changes, build and test on the device that owns the real
+input devices. A typical foreground test loop is:
+
+```sh
+sudo systemctl stop key2gestured
+make clean && make
+sudo ./key2gestured
+```
+
+In another shell, watch service logs after installing:
+
+```sh
+journalctl -u key2gestured -f
+```
+
 ### Install
 
 ```sh
@@ -67,6 +82,7 @@ sudo systemctl enable --now key2gestured
 Edit [`state.h`](state.h) to tune:
 
 - `SCROLL_THRESHOLD` — gesture activation threshold (default: 18)
+- `HORIZONTAL_SCROLL_THRESHOLD` — horizontal activation threshold (default: 36)
 - `TYPING_COOLDOWN_MS` — post-typing suppression window (default: 100)
 - `MOMENTUM_DECAY` — velocity decay factor (default: 0.92)
 - `MAX_DELTA_PER_EVENT` — per-event delta cap (default: 50)
@@ -75,6 +91,20 @@ Edit [`uinput.c`](uinput.c) to tune:
 
 - `ABS_X_MAX` / `ABS_Y_MAX` — virtual touch coordinate range
 - `SCROLL_SCALE_X` / `SCROLL_SCALE_Y` — delta scaling factors
+
+Runtime device paths can be overridden without rebuilding:
+
+```sh
+sudo install -m 0644 /dev/null /etc/default/key2gestured
+sudoedit /etc/default/key2gestured
+```
+
+Example:
+
+```sh
+KEY2GESTURED_TOUCH_DEVICE=/dev/input/by-path/platform-c175000.i2c-event
+KEY2GESTURED_KEYBOARD_DEVICE=/dev/input/event2
+```
 
 ## Device Paths
 
