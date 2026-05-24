@@ -29,6 +29,11 @@
  * Touch starts at screen center to avoid accidental UI activation.
  */
 
+#define DEFAULT_SCROLL_SCALE_X 1
+#define DEFAULT_SCROLL_SCALE_Y 3
+
+void touch_set_scroll_scale(int scale_x, int scale_y);
+
 int setup_uinput_touch(void);
 
 void touch_inject_down(void);

@@ -25,8 +25,12 @@ clean:
 	rm -f key2gestured
 
 install:
-	cp key2gestured /usr/local/bin/
-	cp key2gestured.service /etc/systemd/system/
+	install -d /usr/local/bin /etc/systemd/system /etc/key2gestured
+	install -m 0755 key2gestured /usr/local/bin/
+	install -m 0644 key2gestured.service /etc/systemd/system/
+	@if [ ! -f /etc/key2gestured/default.conf ]; then \
+		install -m 0644 key2gestured.default.conf /etc/key2gestured/default.conf; \
+	fi
 	systemctl daemon-reload
 
 .PHONY: all clean install

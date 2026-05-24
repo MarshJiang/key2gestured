@@ -64,6 +64,12 @@ make clean && make
 sudo ./key2gestured
 ```
 
+To include `/etc/key2gestured/default.conf` in a foreground test:
+
+```sh
+sudo sh -c 'set -a; [ -f /etc/key2gestured/default.conf ] && . /etc/key2gestured/default.conf; exec ./key2gestured'
+```
+
 In another shell, watch service logs after installing:
 
 ```sh
@@ -84,32 +90,36 @@ back to the physical `stmpe_keypad` device for typing suppression.
 
 ## Configuration
 
-Edit [`state.h`](state.h) to tune:
+Runtime configuration lives at `/etc/key2gestured/default.conf`. The file uses
+systemd `EnvironmentFile` syntax:
 
-- `SCROLL_THRESHOLD` — gesture activation threshold (default: 18)
-- `HORIZONTAL_SCROLL_THRESHOLD` — horizontal activation threshold (default: 36)
-- `TYPING_COOLDOWN_MS` — post-typing suppression window (default: 100)
-- `MOMENTUM_DECAY` — velocity decay factor (default: 0.92)
-- `MAX_DELTA_PER_EVENT` — per-event delta cap (default: 50)
+```sh
+KEY2GESTURED_SCROLL_THRESHOLD=18
+KEY2GESTURED_HORIZONTAL_SCROLL_THRESHOLD=36
+KEY2GESTURED_TYPING_COOLDOWN_MS=100
+KEY2GESTURED_GESTURE_TIMEOUT_MS=800
+KEY2GESTURED_MOMENTUM_DECAY=0.92
+KEY2GESTURED_MOMENTUM_MIN_VELOCITY=0.5
+KEY2GESTURED_MOMENTUM_INTERVAL_MS=16
+KEY2GESTURED_MAX_DELTA_PER_EVENT=50
+KEY2GESTURED_SCROLL_SCALE_X=1
+KEY2GESTURED_SCROLL_SCALE_Y=3
+```
 
-Edit [`uinput.c`](uinput.c) to tune:
+`make install` installs [`key2gestured.default.conf`](key2gestured.default.conf)
+to `/etc/key2gestured/default.conf` only if the target file does not already
+exist.
+
+Edit [`uinput.c`](uinput.c) only to change the virtual touch coordinate range:
 
 - `ABS_X_MAX` / `ABS_Y_MAX` — virtual touch coordinate range
-- `SCROLL_SCALE_X` / `SCROLL_SCALE_Y` — delta scaling factors
 
 By default, key2gestured scans `/dev/input/event*` by libevdev device name:
 
 - touch source: `touch_keypad`
 - typing suppression: `keyd virtual keyboard`, falling back to `stmpe_keypad`
 
-Runtime device paths can still be overridden without rebuilding:
-
-```sh
-sudo install -m 0644 /dev/null /etc/default/key2gestured
-sudoedit /etc/default/key2gestured
-```
-
-Example:
+Device paths can also be overridden in `/etc/key2gestured/default.conf`:
 
 ```sh
 KEY2GESTURED_TOUCH_DEVICE=/dev/input/by-path/platform-c175000.i2c-event
@@ -134,6 +144,7 @@ KEY2GESTURED_KEYBOARD_DEVICE=/dev/input/event7
 | [`state.h`](state.h) | Types, enums, and tunable parameters |
 | [`Makefile`](Makefile) | Build system |
 | [`key2gestured.service`](key2gestured.service) | systemd service unit |
+| [`key2gestured.default.conf`](key2gestured.default.conf) | Example runtime configuration |
 
 ## What This Is NOT
 

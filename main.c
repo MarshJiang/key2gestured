@@ -61,6 +61,16 @@ static const char *keyboard_device_path = DEFAULT_KEYBOARD_DEVICE;
 static int touch_device_path_overridden = 0;
 static int keyboard_device_path_overridden = 0;
 
+/* Runtime tunables. Defaults are defined in state.h. */
+static int cfg_typing_cooldown_ms = TYPING_COOLDOWN_MS;
+static int cfg_scroll_threshold = SCROLL_THRESHOLD;
+static int cfg_horizontal_scroll_threshold = HORIZONTAL_SCROLL_THRESHOLD;
+static int cfg_gesture_timeout_ms = GESTURE_TIMEOUT_MS;
+static float cfg_momentum_decay = MOMENTUM_DECAY;
+static float cfg_momentum_min_velocity = MOMENTUM_MIN_VELOCITY;
+static int cfg_momentum_interval_ms = MOMENTUM_INTERVAL_MS;
+static int cfg_max_delta_per_event = MAX_DELTA_PER_EVENT;
+
 /* Momentum state */
 static float momentum_vx = 0.0f;
 static float momentum_vy = 0.0f;
@@ -237,12 +247,82 @@ static int open_input_path(const char *path)
     return fd;
 }
 
+static void load_env_int(const char *name, int *value, int min, int max)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    long parsed;
+
+    if (!text || text[0] == '\0')
+        return;
+
+    errno = 0;
+    parsed = strtol(text, &end, 10);
+    if (errno || end == text || *end != '\0' ||
+        parsed < min || parsed > max) {
+        fprintf(stderr, "Ignoring invalid %s=%s\n", name, text);
+        return;
+    }
+
+    *value = (int)parsed;
+}
+
+static void load_env_float(const char *name, float *value,
+                           float min, float max)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    float parsed;
+
+    if (!text || text[0] == '\0')
+        return;
+
+    errno = 0;
+    parsed = strtof(text, &end);
+    if (errno || end == text || *end != '\0' || !isfinite(parsed) ||
+        parsed < min || parsed > max) {
+        fprintf(stderr, "Ignoring invalid %s=%s\n", name, text);
+        return;
+    }
+
+    *value = parsed;
+}
+
+static void load_runtime_config(void)
+{
+    int scroll_scale_x = DEFAULT_SCROLL_SCALE_X;
+    int scroll_scale_y = DEFAULT_SCROLL_SCALE_Y;
+
+    load_env_int("KEY2GESTURED_TYPING_COOLDOWN_MS",
+                 &cfg_typing_cooldown_ms, 0, 2000);
+    load_env_int("KEY2GESTURED_SCROLL_THRESHOLD",
+                 &cfg_scroll_threshold, 1, 500);
+    load_env_int("KEY2GESTURED_HORIZONTAL_SCROLL_THRESHOLD",
+                 &cfg_horizontal_scroll_threshold, 1, 1000);
+    load_env_int("KEY2GESTURED_GESTURE_TIMEOUT_MS",
+                 &cfg_gesture_timeout_ms, 50, 5000);
+    load_env_float("KEY2GESTURED_MOMENTUM_DECAY",
+                   &cfg_momentum_decay, 0.50f, 0.99f);
+    load_env_float("KEY2GESTURED_MOMENTUM_MIN_VELOCITY",
+                   &cfg_momentum_min_velocity, 0.0f, 50.0f);
+    load_env_int("KEY2GESTURED_MOMENTUM_INTERVAL_MS",
+                 &cfg_momentum_interval_ms, 1, 100);
+    load_env_int("KEY2GESTURED_MAX_DELTA_PER_EVENT",
+                 &cfg_max_delta_per_event, 1, 500);
+    load_env_int("KEY2GESTURED_SCROLL_SCALE_X",
+                 &scroll_scale_x, 1, 16);
+    load_env_int("KEY2GESTURED_SCROLL_SCALE_Y",
+                 &scroll_scale_y, 1, 16);
+
+    touch_set_scroll_scale(scroll_scale_x, scroll_scale_y);
+}
+
 /* ─── Typing suppression ─── */
 
 static int is_typing_active(void)
 {
     long long now = now_ms();
-    return (now - last_key_time_ms) < TYPING_COOLDOWN_MS;
+    return (now - last_key_time_ms) < cfg_typing_cooldown_ms;
 }
 
 static int setup_keyboard(void)
@@ -304,15 +384,15 @@ static void process_keyboard_events(void)
 
 static void inject_scroll_delta(int dx, int dy)
 {
-    if (dy > MAX_DELTA_PER_EVENT)
-        dy = MAX_DELTA_PER_EVENT;
-    else if (dy < -MAX_DELTA_PER_EVENT)
-        dy = -MAX_DELTA_PER_EVENT;
+    if (dy > cfg_max_delta_per_event)
+        dy = cfg_max_delta_per_event;
+    else if (dy < -cfg_max_delta_per_event)
+        dy = -cfg_max_delta_per_event;
 
-    if (dx > MAX_DELTA_PER_EVENT)
-        dx = MAX_DELTA_PER_EVENT;
-    else if (dx < -MAX_DELTA_PER_EVENT)
-        dx = -MAX_DELTA_PER_EVENT;
+    if (dx > cfg_max_delta_per_event)
+        dx = cfg_max_delta_per_event;
+    else if (dx < -cfg_max_delta_per_event)
+        dx = -cfg_max_delta_per_event;
 
     record_velocity(dx, dy);
     touch_inject_move(dx, dy);
@@ -349,7 +429,7 @@ static void exit_scroll_active(void)
         float speed = sqrtf(momentum_vx * momentum_vx +
                             momentum_vy * momentum_vy);
 
-        if (speed > MOMENTUM_MIN_VELOCITY) {
+        if (speed > cfg_momentum_min_velocity) {
             printf("[MOMENTUM] Starting (vx=%.1f, vy=%.1f, speed=%.1f)\n",
                    momentum_vx, momentum_vy, speed);
             state = STATE_MOMENTUM;
@@ -378,13 +458,13 @@ static void process_scroll_motion(int new_y, int new_x)
         int abs_dy = abs(dy);
         int abs_dx = abs(dx);
 
-        if (abs_dy > SCROLL_THRESHOLD ||
-            abs_dx > HORIZONTAL_SCROLL_THRESHOLD) {
+        if (abs_dy > cfg_scroll_threshold ||
+            abs_dx > cfg_horizontal_scroll_threshold) {
             enter_scroll_active(new_x, new_y, dx, dy);
         } else {
             /* Check gesture timeout */
             long long elapsed = now_ms() - gesture_start_ms;
-            if (elapsed > GESTURE_TIMEOUT_MS) {
+            if (elapsed > cfg_gesture_timeout_ms) {
                 state = STATE_IDLE;
                 reset_all_fingers();
             }
@@ -416,7 +496,7 @@ static void process_momentum(void)
 {
     long long now = now_ms();
     long long elapsed = now - momentum_start_ms;
-    long long expected_steps = elapsed / MOMENTUM_INTERVAL_MS;
+    long long expected_steps = elapsed / cfg_momentum_interval_ms;
 
     long long steps = expected_steps - momentum_last_step;
 
@@ -424,13 +504,13 @@ static void process_momentum(void)
         return;
 
     for (long long s = 0; s < steps; s++) {
-        momentum_vx *= MOMENTUM_DECAY;
-        momentum_vy *= MOMENTUM_DECAY;
+        momentum_vx *= cfg_momentum_decay;
+        momentum_vy *= cfg_momentum_decay;
 
         float speed = sqrtf(momentum_vx * momentum_vx +
                             momentum_vy * momentum_vy);
 
-        if (speed < MOMENTUM_MIN_VELOCITY) {
+        if (speed < cfg_momentum_min_velocity) {
             /* Momentum exhausted */
             cancel_scroll_state("[IDLE] Momentum decayed");
             return;
@@ -560,7 +640,9 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
     }
 
     while (running) {
-        int pret = poll(fds, nfds, 8); /* ~8ms timeout for momentum */
+        int poll_timeout = cfg_momentum_interval_ms < 8 ?
+                           cfg_momentum_interval_ms : 8;
+        int pret = poll(fds, nfds, poll_timeout);
 
         if (pret < 0) {
             if (errno == EINTR)
@@ -604,7 +686,7 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
         if (state == STATE_ONE_FINGER_PENDING) {
             long long elapsed = now_ms() - gesture_start_ms;
 
-            if (!fingers[0].active || elapsed > GESTURE_TIMEOUT_MS) {
+            if (!fingers[0].active || elapsed > cfg_gesture_timeout_ms) {
                 state = STATE_IDLE;
                 reset_all_fingers();
                 clear_velocity();
@@ -643,6 +725,8 @@ int main(void)
         keyboard_device_path = env_keyboard_device;
         keyboard_device_path_overridden = 1;
     }
+
+    load_runtime_config();
 
     printf("key2gestured v0.2 — Touch injection scrolling daemon\n");
     printf("====================================================\n\n");
@@ -695,10 +779,15 @@ int main(void)
     }
 
     printf("\nState machine:\n");
-    printf("  Threshold: %d units\n", SCROLL_THRESHOLD);
-    printf("  Typing cooldown: %d ms\n", TYPING_COOLDOWN_MS);
-    printf("  Gesture timeout: %d ms\n", GESTURE_TIMEOUT_MS);
-    printf("  Momentum decay: %.2f\n", MOMENTUM_DECAY);
+    printf("  Threshold: %d units\n", cfg_scroll_threshold);
+    printf("  Horizontal threshold: %d units\n",
+           cfg_horizontal_scroll_threshold);
+    printf("  Typing cooldown: %d ms\n", cfg_typing_cooldown_ms);
+    printf("  Gesture timeout: %d ms\n", cfg_gesture_timeout_ms);
+    printf("  Momentum decay: %.2f\n", cfg_momentum_decay);
+    printf("  Momentum min velocity: %.2f\n", cfg_momentum_min_velocity);
+    printf("  Momentum interval: %d ms\n", cfg_momentum_interval_ms);
+    printf("  Max delta per event: %d units\n", cfg_max_delta_per_event);
     printf("\nReady. Touch the keyboard touch surface to scroll.\n");
     printf("------------------------------------------\n");
 

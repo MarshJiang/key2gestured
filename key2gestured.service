@@ -23,7 +23,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/default/key2gestured
+EnvironmentFile=-/etc/key2gestured/default.conf
 ExecStart=/usr/local/bin/key2gestured
 Restart=on-failure
 RestartSec=5
