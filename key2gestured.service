@@ -17,7 +17,8 @@
 [Unit]
 Description=KEY2 Gesture Daemon
 Documentation=https://github.com/MarshJiang/key2gestured
-After=graphical-session.target
+Wants=keyd.service systemd-udev-settle.service
+After=keyd.service systemd-udev-settle.service graphical-session.target
 PartOf=graphical-session.target
 
 [Service]

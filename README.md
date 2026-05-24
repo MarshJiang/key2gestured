@@ -77,6 +77,11 @@ sudo make install
 sudo systemctl enable --now key2gestured
 ```
 
+The systemd unit orders itself after `keyd.service` and
+`systemd-udev-settle.service` so the auto-detected input devices are likely to
+exist before the daemon starts. If keyd is not installed, key2gestured falls
+back to the physical `stmpe_keypad` device for typing suppression.
+
 ## Configuration
 
 Edit [`state.h`](state.h) to tune:
@@ -92,7 +97,12 @@ Edit [`uinput.c`](uinput.c) to tune:
 - `ABS_X_MAX` / `ABS_Y_MAX` — virtual touch coordinate range
 - `SCROLL_SCALE_X` / `SCROLL_SCALE_Y` — delta scaling factors
 
-Runtime device paths can be overridden without rebuilding:
+By default, key2gestured scans `/dev/input/event*` by libevdev device name:
+
+- touch source: `touch_keypad`
+- typing suppression: `keyd virtual keyboard`, falling back to `stmpe_keypad`
+
+Runtime device paths can still be overridden without rebuilding:
 
 ```sh
 sudo install -m 0644 /dev/null /etc/default/key2gestured
@@ -103,15 +113,16 @@ Example:
 
 ```sh
 KEY2GESTURED_TOUCH_DEVICE=/dev/input/by-path/platform-c175000.i2c-event
-KEY2GESTURED_KEYBOARD_DEVICE=/dev/input/event2
+KEY2GESTURED_KEYBOARD_DEVICE=/dev/input/event7
 ```
 
 ## Device Paths
 
 | Device | Path | Role |
 |--------|------|------|
-| `touch_keypad` | `/dev/input/by-path/platform-c175000.i2c-event` | Gesture source |
-| `stmpe_keypad` | `/dev/input/event2` | Typing suppression |
+| `touch_keypad` | auto-detected by name, fallback `/dev/input/by-path/platform-c175000.i2c-event` | Gesture source |
+| `keyd virtual keyboard` | auto-detected by name | Typing suppression after keyd remapping |
+| `stmpe_keypad` | auto-detected by name, fallback `/dev/input/event2` | Typing suppression without keyd |
 
 ## Files
 

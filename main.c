@@ -26,6 +26,8 @@
 #include <time.h>
 #include <string.h>
 #include <signal.h>
+#include <dirent.h>
+#include <limits.h>
 
 #include <linux/input.h>
 #include <libevdev/libevdev.h>
@@ -38,6 +40,9 @@
  */
 #define DEFAULT_TOUCH_DEVICE   "/dev/input/by-path/platform-c175000.i2c-event"
 #define DEFAULT_KEYBOARD_DEVICE "/dev/input/event2"
+#define TOUCH_DEVICE_NAME      "touch_keypad"
+#define KEYD_KEYBOARD_NAME     "keyd virtual keyboard"
+#define KEYBOARD_DEVICE_NAME   "stmpe_keypad"
 
 /*
  * Global state
@@ -53,6 +58,8 @@ static struct libevdev *keyboard_dev = NULL;
 static volatile sig_atomic_t running = 1;
 static const char *touch_device_path = DEFAULT_TOUCH_DEVICE;
 static const char *keyboard_device_path = DEFAULT_KEYBOARD_DEVICE;
+static int touch_device_path_overridden = 0;
+static int keyboard_device_path_overridden = 0;
 
 /* Momentum state */
 static float momentum_vx = 0.0f;
@@ -169,6 +176,67 @@ static void cancel_scroll_state(const char *reason)
     printf("%s\n", reason);
 }
 
+static int open_named_input_device(const char *name, const char **matched_path)
+{
+    DIR *dir;
+    struct dirent *entry;
+    int found_fd = -1;
+
+    dir = opendir("/dev/input");
+    if (!dir) {
+        perror("opendir /dev/input");
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char path[PATH_MAX];
+        struct libevdev *dev = NULL;
+        int fd;
+        const char *dev_name;
+
+        if (strncmp(entry->d_name, "event", 5) != 0)
+            continue;
+
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+        fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0)
+            continue;
+
+        if (libevdev_new_from_fd(fd, &dev) < 0) {
+            close(fd);
+            continue;
+        }
+
+        dev_name = libevdev_get_name(dev);
+        if (dev_name && strcmp(dev_name, name) == 0) {
+            char *saved_path = strdup(path);
+
+            libevdev_free(dev);
+            if (saved_path)
+                *matched_path = saved_path;
+            found_fd = fd;
+            break;
+        }
+
+        libevdev_free(dev);
+        close(fd);
+    }
+
+    closedir(dir);
+    return found_fd;
+}
+
+static int open_input_path(const char *path)
+{
+    int fd;
+
+    fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0)
+        perror(path);
+
+    return fd;
+}
+
 /* ─── Typing suppression ─── */
 
 static int is_typing_active(void)
@@ -182,7 +250,17 @@ static int setup_keyboard(void)
     struct libevdev *dev = NULL;
     int fd;
 
-    fd = open(keyboard_device_path, O_RDONLY | O_NONBLOCK);
+    if (keyboard_device_path_overridden) {
+        fd = open_input_path(keyboard_device_path);
+    } else {
+        fd = open_named_input_device(KEYD_KEYBOARD_NAME, &keyboard_device_path);
+        if (fd < 0)
+            fd = open_named_input_device(KEYBOARD_DEVICE_NAME,
+                                         &keyboard_device_path);
+        if (fd < 0)
+            fd = open_input_path(keyboard_device_path);
+    }
+
     if (fd < 0) {
         perror("open keyboard device");
         return -1;
@@ -555,18 +633,31 @@ int main(void)
     signal(SIGTERM, handle_signal);
 
     env_touch_device = getenv("KEY2GESTURED_TOUCH_DEVICE");
-    if (env_touch_device && env_touch_device[0] != '\0')
+    if (env_touch_device && env_touch_device[0] != '\0') {
         touch_device_path = env_touch_device;
+        touch_device_path_overridden = 1;
+    }
 
     env_keyboard_device = getenv("KEY2GESTURED_KEYBOARD_DEVICE");
-    if (env_keyboard_device && env_keyboard_device[0] != '\0')
+    if (env_keyboard_device && env_keyboard_device[0] != '\0') {
         keyboard_device_path = env_keyboard_device;
+        keyboard_device_path_overridden = 1;
+    }
 
     printf("key2gestured v0.2 — Touch injection scrolling daemon\n");
     printf("====================================================\n\n");
 
     /* Open touch device */
-    int fd = open(touch_device_path, O_RDONLY | O_NONBLOCK);
+    int fd;
+
+    if (touch_device_path_overridden) {
+        fd = open_input_path(touch_device_path);
+    } else {
+        fd = open_named_input_device(TOUCH_DEVICE_NAME, &touch_device_path);
+        if (fd < 0)
+            fd = open_input_path(touch_device_path);
+    }
+
     if (fd < 0) {
         perror("open touch device");
         return 1;
