@@ -19,15 +19,17 @@ Description=KEY2 Gesture Daemon
 Documentation=https://github.com/MarshJiang/key2gestured
 Wants=keyd.service systemd-udev-settle.service
 After=keyd.service systemd-udev-settle.service graphical-session.target
+StartLimitIntervalSec=60
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/key2gestured/default.conf
 ExecStart=/usr/local/bin/key2gestured
+ExecReload=/usr/local/bin/key2gestured reload
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
+TimeoutStopSec=10
 
 # Must run as root to access /dev/input event devices and /dev/uinput.
 User=root

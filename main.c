@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <dirent.h>
 #include <limits.h>
+#include <ctype.h>
 
 #include <linux/input.h>
 #include <libevdev/libevdev.h>
@@ -43,6 +44,9 @@
 #define TOUCH_DEVICE_NAME      "touch_keypad"
 #define KEYD_KEYBOARD_NAME     "keyd virtual keyboard"
 #define KEYBOARD_DEVICE_NAME   "stmpe_keypad"
+#define CONFIG_PATH           "/etc/key2gestured/default.conf"
+#define PID_PATH              "/run/key2gestured.pid"
+#define CONFIG_LINE_MAX       512
 
 /*
  * Global state
@@ -60,6 +64,8 @@ static const char *touch_device_path = DEFAULT_TOUCH_DEVICE;
 static const char *keyboard_device_path = DEFAULT_KEYBOARD_DEVICE;
 static int touch_device_path_overridden = 0;
 static int keyboard_device_path_overridden = 0;
+static volatile sig_atomic_t reload_requested = 0;
+static volatile sig_atomic_t shutdown_requested = 0;
 
 /* Runtime tunables. Defaults are defined in state.h. */
 static int cfg_typing_cooldown_ms = TYPING_COOLDOWN_MS;
@@ -70,6 +76,19 @@ static float cfg_momentum_decay = MOMENTUM_DECAY;
 static float cfg_momentum_min_velocity = MOMENTUM_MIN_VELOCITY;
 static int cfg_momentum_interval_ms = MOMENTUM_INTERVAL_MS;
 static int cfg_max_delta_per_event = MAX_DELTA_PER_EVENT;
+
+typedef struct {
+    int typing_cooldown_ms;
+    int scroll_threshold;
+    int horizontal_scroll_threshold;
+    int gesture_timeout_ms;
+    float momentum_decay;
+    float momentum_min_velocity;
+    int momentum_interval_ms;
+    int max_delta_per_event;
+    int scroll_scale_x;
+    int scroll_scale_y;
+} RuntimeConfig;
 
 /* Momentum state */
 static float momentum_vx = 0.0f;
@@ -247,48 +266,114 @@ static int open_input_path(const char *path)
     return fd;
 }
 
-static void load_env_int(const char *name, int *value, int min, int max)
+static char *trim(char *text)
 {
-    const char *text = getenv(name);
+    char *end;
+
+    while (isspace((unsigned char)*text))
+        text++;
+
+    if (*text == '\0')
+        return text;
+
+    end = text + strlen(text) - 1;
+    while (end > text && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+
+    return text;
+}
+
+static int parse_int_value(const char *name, const char *text,
+                           int *value, int min, int max)
+{
     char *end = NULL;
     long parsed;
-
-    if (!text || text[0] == '\0')
-        return;
 
     errno = 0;
     parsed = strtol(text, &end, 10);
     if (errno || end == text || *end != '\0' ||
         parsed < min || parsed > max) {
         fprintf(stderr, "Ignoring invalid %s=%s\n", name, text);
-        return;
+        return -1;
     }
 
     *value = (int)parsed;
+    return 0;
 }
 
-static void load_env_float(const char *name, float *value,
-                           float min, float max)
+static int parse_float_value(const char *name, const char *text,
+                             float *value, float min, float max)
 {
-    const char *text = getenv(name);
     char *end = NULL;
     float parsed;
-
-    if (!text || text[0] == '\0')
-        return;
 
     errno = 0;
     parsed = strtof(text, &end);
     if (errno || end == text || *end != '\0' || !isfinite(parsed) ||
         parsed < min || parsed > max) {
         fprintf(stderr, "Ignoring invalid %s=%s\n", name, text);
-        return;
+        return -1;
     }
 
     *value = parsed;
+    return 0;
 }
 
-static void load_runtime_config(void)
+static void load_env_int(const char *name, int *value, int min, int max)
+{
+    const char *text = getenv(name);
+
+    if (!text || text[0] == '\0')
+        return;
+
+    parse_int_value(name, text, value, min, max);
+}
+
+static void load_env_float(const char *name, float *value,
+                           float min, float max)
+{
+    const char *text = getenv(name);
+
+    if (!text || text[0] == '\0')
+        return;
+
+    parse_float_value(name, text, value, min, max);
+}
+
+static RuntimeConfig default_runtime_config(void)
+{
+    RuntimeConfig config;
+
+    config.typing_cooldown_ms = TYPING_COOLDOWN_MS;
+    config.scroll_threshold = SCROLL_THRESHOLD;
+    config.horizontal_scroll_threshold = HORIZONTAL_SCROLL_THRESHOLD;
+    config.gesture_timeout_ms = GESTURE_TIMEOUT_MS;
+    config.momentum_decay = MOMENTUM_DECAY;
+    config.momentum_min_velocity = MOMENTUM_MIN_VELOCITY;
+    config.momentum_interval_ms = MOMENTUM_INTERVAL_MS;
+    config.max_delta_per_event = MAX_DELTA_PER_EVENT;
+    config.scroll_scale_x = DEFAULT_SCROLL_SCALE_X;
+    config.scroll_scale_y = DEFAULT_SCROLL_SCALE_Y;
+
+    return config;
+}
+
+static void apply_runtime_config(const RuntimeConfig *config)
+{
+    cfg_typing_cooldown_ms = config->typing_cooldown_ms;
+    cfg_scroll_threshold = config->scroll_threshold;
+    cfg_horizontal_scroll_threshold = config->horizontal_scroll_threshold;
+    cfg_gesture_timeout_ms = config->gesture_timeout_ms;
+    cfg_momentum_decay = config->momentum_decay;
+    cfg_momentum_min_velocity = config->momentum_min_velocity;
+    cfg_momentum_interval_ms = config->momentum_interval_ms;
+    cfg_max_delta_per_event = config->max_delta_per_event;
+    touch_set_scroll_scale(config->scroll_scale_x, config->scroll_scale_y);
+}
+
+static void load_runtime_config_from_env(void)
 {
     int scroll_scale_x = DEFAULT_SCROLL_SCALE_X;
     int scroll_scale_y = DEFAULT_SCROLL_SCALE_Y;
@@ -315,6 +400,267 @@ static void load_runtime_config(void)
                  &scroll_scale_y, 1, 16);
 
     touch_set_scroll_scale(scroll_scale_x, scroll_scale_y);
+}
+
+static int apply_config_pair(RuntimeConfig *config,
+                             const char *key, const char *value,
+                             int line_no)
+{
+    if (strcmp(key, "KEY2GESTURED_TYPING_COOLDOWN_MS") == 0)
+        return parse_int_value(key, value, &config->typing_cooldown_ms,
+                               0, 2000);
+    if (strcmp(key, "KEY2GESTURED_SCROLL_THRESHOLD") == 0)
+        return parse_int_value(key, value, &config->scroll_threshold,
+                               1, 500);
+    if (strcmp(key, "KEY2GESTURED_HORIZONTAL_SCROLL_THRESHOLD") == 0)
+        return parse_int_value(key, value,
+                               &config->horizontal_scroll_threshold,
+                               1, 1000);
+    if (strcmp(key, "KEY2GESTURED_GESTURE_TIMEOUT_MS") == 0)
+        return parse_int_value(key, value, &config->gesture_timeout_ms,
+                               50, 5000);
+    if (strcmp(key, "KEY2GESTURED_MOMENTUM_DECAY") == 0)
+        return parse_float_value(key, value, &config->momentum_decay,
+                                 0.50f, 0.99f);
+    if (strcmp(key, "KEY2GESTURED_MOMENTUM_MIN_VELOCITY") == 0)
+        return parse_float_value(key, value,
+                                 &config->momentum_min_velocity,
+                                 0.0f, 50.0f);
+    if (strcmp(key, "KEY2GESTURED_MOMENTUM_INTERVAL_MS") == 0)
+        return parse_int_value(key, value,
+                               &config->momentum_interval_ms,
+                               1, 100);
+    if (strcmp(key, "KEY2GESTURED_MAX_DELTA_PER_EVENT") == 0)
+        return parse_int_value(key, value, &config->max_delta_per_event,
+                               1, 500);
+    if (strcmp(key, "KEY2GESTURED_SCROLL_SCALE_X") == 0)
+        return parse_int_value(key, value, &config->scroll_scale_x, 1, 16);
+    if (strcmp(key, "KEY2GESTURED_SCROLL_SCALE_Y") == 0)
+        return parse_int_value(key, value, &config->scroll_scale_y, 1, 16);
+
+    if (strcmp(key, "KEY2GESTURED_TOUCH_DEVICE") == 0 ||
+        strcmp(key, "KEY2GESTURED_KEYBOARD_DEVICE") == 0) {
+        printf("[CONFIG] %s changes require restart\n", key);
+        return 0;
+    }
+
+    fprintf(stderr, "Ignoring unknown config key %s on line %d\n",
+            key, line_no);
+    return 0;
+}
+
+static int load_runtime_config_from_file(const char *path,
+                                         RuntimeConfig *config)
+{
+    FILE *file;
+    char line[CONFIG_LINE_MAX];
+    int line_no = 0;
+    int errors = 0;
+
+    file = fopen(path, "r");
+    if (!file) {
+        if (errno == ENOENT)
+            return 0;
+
+        perror(path);
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), file)) {
+        char *text;
+        char *eq;
+        char *key;
+        char *value;
+
+        line_no++;
+        text = trim(line);
+        if (text[0] == '\0' || text[0] == '#')
+            continue;
+
+        eq = strchr(text, '=');
+        if (!eq) {
+            fprintf(stderr, "Ignoring malformed config line %d\n", line_no);
+            errors++;
+            continue;
+        }
+
+        *eq = '\0';
+        key = trim(text);
+        value = trim(eq + 1);
+
+        if (value[0] == '"' || value[0] == '\'') {
+            char quote = value[0];
+            size_t len = strlen(value);
+
+            if (len >= 2 && value[len - 1] == quote) {
+                value[len - 1] = '\0';
+                value++;
+            }
+        }
+
+        if (apply_config_pair(config, key, value, line_no) < 0)
+            errors++;
+    }
+
+    if (ferror(file)) {
+        perror(path);
+        errors++;
+    }
+
+    fclose(file);
+    return errors ? -1 : 0;
+}
+
+static int load_runtime_config_file(const char *action)
+{
+    RuntimeConfig config = default_runtime_config();
+
+    if (load_runtime_config_from_file(CONFIG_PATH, &config) < 0) {
+        fprintf(stderr, "[CONFIG] %s failed; keeping current settings\n",
+                action);
+        return -1;
+    }
+
+    apply_runtime_config(&config);
+    printf("[CONFIG] %s %s\n", action, CONFIG_PATH);
+    return 0;
+}
+
+static int reload_runtime_config(void)
+{
+    if (load_runtime_config_file("Reload") < 0)
+        return -1;
+
+    return 0;
+}
+
+static int write_pid_file(void)
+{
+    FILE *file;
+
+    file = fopen(PID_PATH, "w");
+    if (!file) {
+        perror(PID_PATH);
+        return -1;
+    }
+
+    fprintf(file, "%ld\n", (long)getpid());
+    if (fclose(file) < 0) {
+        perror(PID_PATH);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int read_pid_file(pid_t *pid)
+{
+    FILE *file;
+    long parsed;
+
+    file = fopen(PID_PATH, "r");
+    if (!file)
+        return -1;
+
+    if (fscanf(file, "%ld", &parsed) != 1 || parsed <= 0) {
+        fprintf(stderr, "Invalid pid file: %s\n", PID_PATH);
+        fclose(file);
+        return -1;
+    }
+
+    fclose(file);
+    *pid = (pid_t)parsed;
+    return 0;
+}
+
+static int read_process_comm(pid_t pid, char *comm, size_t comm_size)
+{
+    char path[64];
+    FILE *file;
+
+    snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
+    file = fopen(path, "r");
+    if (!file)
+        return -1;
+
+    if (!fgets(comm, comm_size, file)) {
+        fclose(file);
+        return -1;
+    }
+
+    fclose(file);
+    comm[strcspn(comm, "\n")] = '\0';
+    return 0;
+}
+
+static int find_running_daemon(pid_t *pid)
+{
+    DIR *dir;
+    struct dirent *entry;
+    pid_t self = getpid();
+
+    dir = opendir("/proc");
+    if (!dir) {
+        perror("opendir /proc");
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char *end = NULL;
+        long parsed;
+        char comm[64];
+
+        errno = 0;
+        parsed = strtol(entry->d_name, &end, 10);
+        if (errno || end == entry->d_name || *end != '\0' || parsed <= 0)
+            continue;
+
+        if ((pid_t)parsed == self)
+            continue;
+
+        if (read_process_comm((pid_t)parsed, comm, sizeof(comm)) < 0)
+            continue;
+
+        if (strcmp(comm, "key2gestured") == 0) {
+            *pid = (pid_t)parsed;
+            closedir(dir);
+            return 0;
+        }
+    }
+
+    closedir(dir);
+    return -1;
+}
+
+static int send_reload_signal(void)
+{
+    pid_t pid;
+
+    if (read_pid_file(&pid) < 0 &&
+        find_running_daemon(&pid) < 0) {
+        fprintf(stderr,
+                "Could not find running key2gestured daemon. "
+                "Check `systemctl status key2gestured`.\n");
+        return 1;
+    }
+
+    if (kill(pid, SIGHUP) < 0) {
+        int kill_errno = errno;
+
+        if (kill_errno == ESRCH && find_running_daemon(&pid) == 0 &&
+            kill(pid, SIGHUP) == 0) {
+            printf("Reload signal sent to key2gestured (pid %ld)\n",
+                   (long)pid);
+            return 0;
+        }
+
+        errno = kill_errno;
+        perror("kill SIGHUP");
+        return 1;
+    }
+
+    printf("Reload signal sent to key2gestured (pid %ld)\n", (long)pid);
+    return 0;
 }
 
 /* ─── Typing suppression ─── */
@@ -651,6 +997,11 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
             break;
         }
 
+        if (reload_requested) {
+            reload_requested = 0;
+            reload_runtime_config();
+        }
+
         /* Process keyboard events first (typing suppression) */
         if (nfds > 1 && (fds[1].revents & POLLIN)) {
             process_keyboard_events();
@@ -701,18 +1052,54 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
 
 static void handle_signal(int signum)
 {
-    (void)signum;
-    running = 0;
+    if (signum == SIGHUP) {
+        reload_requested = 1;
+    } else {
+        shutdown_requested = 1;
+        running = 0;
+    }
 }
 
-int main(void)
+static int setup_signal_handlers(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_signal;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(SIGINT, &action, NULL) < 0) {
+        perror("sigaction SIGINT");
+        return -1;
+    }
+    if (sigaction(SIGTERM, &action, NULL) < 0) {
+        perror("sigaction SIGTERM");
+        return -1;
+    }
+    if (sigaction(SIGHUP, &action, NULL) < 0) {
+        perror("sigaction SIGHUP");
+        return -1;
+    }
+
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     struct libevdev *touch_dev = NULL;
     const char *env_touch_device;
     const char *env_keyboard_device;
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    if (argc > 1) {
+        if (strcmp(argv[1], "reload") == 0)
+            return send_reload_signal();
+
+        fprintf(stderr, "Usage: %s [reload]\n", argv[0]);
+        return 2;
+    }
+
+    if (setup_signal_handlers() < 0)
+        return 1;
 
     env_touch_device = getenv("KEY2GESTURED_TOUCH_DEVICE");
     if (env_touch_device && env_touch_device[0] != '\0') {
@@ -726,10 +1113,14 @@ int main(void)
         keyboard_device_path_overridden = 1;
     }
 
-    load_runtime_config();
+    load_runtime_config_from_env();
+    load_runtime_config_file("Loaded");
 
     printf("key2gestured v0.2 — Touch injection scrolling daemon\n");
     printf("====================================================\n\n");
+
+    if (write_pid_file() < 0)
+        return 1;
 
     /* Open touch device */
     int fd;
@@ -744,12 +1135,14 @@ int main(void)
 
     if (fd < 0) {
         perror("open touch device");
+        unlink(PID_PATH);
         return 1;
     }
 
     if (libevdev_new_from_fd(fd, &touch_dev) < 0) {
         fprintf(stderr, "Failed to init libevdev for touch\n");
         close(fd);
+        unlink(PID_PATH);
         return 1;
     }
 
@@ -775,6 +1168,7 @@ int main(void)
         libevdev_grab(touch_dev, LIBEVDEV_UNGRAB);
         libevdev_free(touch_dev);
         close(fd);
+        unlink(PID_PATH);
         return 1;
     }
 
@@ -793,6 +1187,11 @@ int main(void)
 
     event_loop(touch_dev, fd);
 
+    if (shutdown_requested) {
+        unlink(PID_PATH);
+        return 0;
+    }
+
     /* Cleanup */
     touch_close();
     if (keyboard_dev) {
@@ -802,6 +1201,7 @@ int main(void)
     libevdev_grab(touch_dev, LIBEVDEV_UNGRAB);
     libevdev_free(touch_dev);
     close(fd);
+    unlink(PID_PATH);
 
     return 0;
 }

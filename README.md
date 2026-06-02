@@ -76,6 +76,19 @@ In another shell, watch service logs after installing:
 journalctl -u key2gestured -f
 ```
 
+After editing `/etc/key2gestured/default.conf`, reload tunable gesture settings
+without restarting the daemon:
+
+```sh
+sudo key2gestured reload
+```
+
+Device path changes still require a restart because input devices must be
+closed and reopened.
+
+The service uses a finite stop timeout so shutdown does not hang indefinitely
+if an input device cleanup path stalls.
+
 ### Install
 
 ```sh
