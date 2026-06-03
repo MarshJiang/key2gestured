@@ -40,13 +40,20 @@
  * Device paths
  */
 #define DEFAULT_TOUCH_DEVICE   "/dev/input/by-path/platform-c175000.i2c-event"
-#define DEFAULT_KEYBOARD_DEVICE "/dev/input/event2"
+#define FALLBACK_TOUCH_DEVICE  "/dev/input/event1"
+#define DEFAULT_KEYBOARD_DEVICE "/dev/input/event7"
+#define FALLBACK_KEYBOARD_DEVICE "/dev/input/event2"
 #define TOUCH_DEVICE_NAME      "touch_keypad"
 #define KEYD_KEYBOARD_NAME     "keyd virtual keyboard"
 #define KEYBOARD_DEVICE_NAME   "stmpe_keypad"
 #define CONFIG_PATH           "/etc/key2gestured/default.conf"
 #define PID_PATH              "/run/key2gestured.pid"
+#define READY_PATH            "/run/key2gestured.ready"
 #define CONFIG_LINE_MAX       512
+#define RELOAD_FIND_RETRIES   20
+#define RELOAD_FIND_DELAY_US  100000
+#define CGROUP_V2_PROCS       "/sys/fs/cgroup/system.slice/key2gestured.service/cgroup.procs"
+#define CGROUP_V1_TASKS       "/sys/fs/cgroup/system.slice/key2gestured.service/tasks"
 
 /*
  * Global state
@@ -64,6 +71,7 @@ static const char *touch_device_path = DEFAULT_TOUCH_DEVICE;
 static const char *keyboard_device_path = DEFAULT_KEYBOARD_DEVICE;
 static int touch_device_path_overridden = 0;
 static int keyboard_device_path_overridden = 0;
+static int scan_input_devices = 0;
 static volatile sig_atomic_t reload_requested = 0;
 static volatile sig_atomic_t shutdown_requested = 0;
 
@@ -198,7 +206,8 @@ static void end_injected_touch(void)
 
 static void cancel_scroll_state(const char *reason)
 {
-    end_injected_touch();
+    if (!shutdown_requested)
+        end_injected_touch();
     state = STATE_IDLE;
     reset_all_fingers();
     clear_velocity();
@@ -217,7 +226,7 @@ static int open_named_input_device(const char *name, const char **matched_path)
         return -1;
     }
 
-    while ((entry = readdir(dir)) != NULL) {
+    while (running && (entry = readdir(dir)) != NULL) {
         char path[PATH_MAX];
         struct libevdev *dev = NULL;
         int fd;
@@ -264,6 +273,34 @@ static int open_input_path(const char *path)
         perror(path);
 
     return fd;
+}
+
+static int open_input_path_if_named(const char *path, const char *name,
+                                    const char **matched_path)
+{
+    struct libevdev *dev = NULL;
+    int fd;
+    const char *dev_name;
+
+    fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+
+    if (libevdev_new_from_fd(fd, &dev) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    dev_name = libevdev_get_name(dev);
+    if (dev_name && strcmp(dev_name, name) == 0) {
+        libevdev_free(dev);
+        *matched_path = path;
+        return fd;
+    }
+
+    libevdev_free(dev);
+    close(fd);
+    return -1;
 }
 
 static char *trim(char *text)
@@ -439,7 +476,8 @@ static int apply_config_pair(RuntimeConfig *config,
         return parse_int_value(key, value, &config->scroll_scale_y, 1, 16);
 
     if (strcmp(key, "KEY2GESTURED_TOUCH_DEVICE") == 0 ||
-        strcmp(key, "KEY2GESTURED_KEYBOARD_DEVICE") == 0) {
+        strcmp(key, "KEY2GESTURED_KEYBOARD_DEVICE") == 0 ||
+        strcmp(key, "KEY2GESTURED_SCAN_INPUTS") == 0) {
         printf("[CONFIG] %s changes require restart\n", key);
         return 0;
     }
@@ -553,6 +591,31 @@ static int write_pid_file(void)
     return 0;
 }
 
+static void remove_runtime_files(void)
+{
+    unlink(READY_PATH);
+    unlink(PID_PATH);
+}
+
+static int write_ready_file(void)
+{
+    FILE *file;
+
+    file = fopen(READY_PATH, "w");
+    if (!file) {
+        perror(READY_PATH);
+        return -1;
+    }
+
+    fprintf(file, "%ld\n", (long)getpid());
+    if (fclose(file) < 0) {
+        perror(READY_PATH);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int read_pid_file(pid_t *pid)
 {
     FILE *file;
@@ -564,6 +627,26 @@ static int read_pid_file(pid_t *pid)
 
     if (fscanf(file, "%ld", &parsed) != 1 || parsed <= 0) {
         fprintf(stderr, "Invalid pid file: %s\n", PID_PATH);
+        fclose(file);
+        return -1;
+    }
+
+    fclose(file);
+    *pid = (pid_t)parsed;
+    return 0;
+}
+
+static int read_ready_file(pid_t *pid)
+{
+    FILE *file;
+    long parsed;
+
+    file = fopen(READY_PATH, "r");
+    if (!file)
+        return -1;
+
+    if (fscanf(file, "%ld", &parsed) != 1 || parsed <= 0) {
+        fprintf(stderr, "Invalid ready file: %s\n", READY_PATH);
         fclose(file);
         return -1;
     }
@@ -593,6 +676,50 @@ static int read_process_comm(pid_t pid, char *comm, size_t comm_size)
     return 0;
 }
 
+static int process_cmdline_contains(pid_t pid, const char *needle)
+{
+    char path[64];
+    char cmdline[PATH_MAX];
+    FILE *file;
+    size_t len;
+
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+    file = fopen(path, "r");
+    if (!file)
+        return 0;
+
+    len = fread(cmdline, 1, sizeof(cmdline) - 1, file);
+    fclose(file);
+
+    if (len == 0)
+        return 0;
+
+    cmdline[len] = '\0';
+    for (size_t i = 0; i < len; i++) {
+        if (cmdline[i] == '\0')
+            cmdline[i] = ' ';
+    }
+
+    return strstr(cmdline, needle) != NULL;
+}
+
+static int pid_is_daemon(pid_t pid)
+{
+    char comm[64];
+
+    if (pid <= 0 || pid == getpid())
+        return 0;
+
+    if (kill(pid, 0) < 0)
+        return 0;
+
+    if (read_process_comm(pid, comm, sizeof(comm)) == 0 &&
+        strcmp(comm, "key2gestured") == 0)
+        return 1;
+
+    return process_cmdline_contains(pid, "/usr/local/bin/key2gestured");
+}
+
 static int find_running_daemon(pid_t *pid)
 {
     DIR *dir;
@@ -608,8 +735,6 @@ static int find_running_daemon(pid_t *pid)
     while ((entry = readdir(dir)) != NULL) {
         char *end = NULL;
         long parsed;
-        char comm[64];
-
         errno = 0;
         parsed = strtol(entry->d_name, &end, 10);
         if (errno || end == entry->d_name || *end != '\0' || parsed <= 0)
@@ -618,10 +743,7 @@ static int find_running_daemon(pid_t *pid)
         if ((pid_t)parsed == self)
             continue;
 
-        if (read_process_comm((pid_t)parsed, comm, sizeof(comm)) < 0)
-            continue;
-
-        if (strcmp(comm, "key2gestured") == 0) {
+        if (pid_is_daemon((pid_t)parsed)) {
             *pid = (pid_t)parsed;
             closedir(dir);
             return 0;
@@ -632,34 +754,124 @@ static int find_running_daemon(pid_t *pid)
     return -1;
 }
 
+static int read_cgroup_pid_file(const char *path, pid_t *pid)
+{
+    FILE *file;
+    long parsed;
+    pid_t self = getpid();
+
+    file = fopen(path, "r");
+    if (!file)
+        return -1;
+
+    while (fscanf(file, "%ld", &parsed) == 1) {
+        if (parsed <= 0 || (pid_t)parsed == self)
+            continue;
+
+        if (kill((pid_t)parsed, 0) == 0) {
+            fclose(file);
+            *pid = (pid_t)parsed;
+            return 0;
+        }
+    }
+
+    fclose(file);
+    return -1;
+}
+
+static int find_daemon_from_cgroup(pid_t *pid)
+{
+    if (read_cgroup_pid_file(CGROUP_V2_PROCS, pid) == 0)
+        return 0;
+
+    if (read_cgroup_pid_file(CGROUP_V1_TASKS, pid) == 0)
+        return 0;
+
+    return -1;
+}
+
+static int find_daemon_once(pid_t *pid)
+{
+    if (read_pid_file(pid) == 0 && pid_is_daemon(*pid))
+        return 0;
+
+    if (find_daemon_from_cgroup(pid) == 0 && pid_is_daemon(*pid))
+        return 0;
+
+    if (find_running_daemon(pid) == 0)
+        return 0;
+
+    return -1;
+}
+
 static int send_reload_signal(void)
 {
     pid_t pid;
+    int daemon_seen = 0;
 
-    if (read_pid_file(&pid) < 0 &&
-        find_running_daemon(&pid) < 0) {
+    for (int i = 0; i < RELOAD_FIND_RETRIES; i++) {
+        if (read_ready_file(&pid) == 0 && pid_is_daemon(pid)) {
+            if (kill(pid, SIGHUP) == 0) {
+                printf("Reload signal sent to key2gestured (pid %ld)\n",
+                       (long)pid);
+                return 0;
+            }
+
+            perror("kill SIGHUP");
+            return 1;
+        }
+
+        if (!daemon_seen && find_daemon_once(&pid) == 0)
+            daemon_seen = 1;
+
+        usleep(RELOAD_FIND_DELAY_US);
+    }
+
+    if (daemon_seen) {
         fprintf(stderr,
-                "Could not find running key2gestured daemon. "
-                "Check `systemctl status key2gestured`.\n");
+                "key2gestured is running but not ready for reload yet. "
+                "Wait for the Ready log line, then retry.\n");
         return 1;
     }
 
-    if (kill(pid, SIGHUP) < 0) {
-        int kill_errno = errno;
+    fprintf(stderr,
+            "Could not find running key2gestured daemon. "
+            "Check `systemctl status key2gestured`.\n");
+    return 1;
+}
 
-        if (kill_errno == ESRCH && find_running_daemon(&pid) == 0 &&
-            kill(pid, SIGHUP) == 0) {
-            printf("Reload signal sent to key2gestured (pid %ld)\n",
+static int send_stop_signal(void)
+{
+    pid_t pid;
+
+    if (read_ready_file(&pid) == 0 && pid_is_daemon(pid)) {
+        if (kill(pid, SIGTERM) == 0) {
+            printf("Stop signal sent to key2gestured (pid %ld)\n",
                    (long)pid);
             return 0;
         }
 
-        errno = kill_errno;
-        perror("kill SIGHUP");
-        return 1;
+        if (errno != ESRCH) {
+            perror("kill SIGTERM");
+            return 1;
+        }
     }
 
-    printf("Reload signal sent to key2gestured (pid %ld)\n", (long)pid);
+    if (read_pid_file(&pid) == 0 && pid_is_daemon(pid)) {
+        if (kill(pid, SIGTERM) == 0) {
+            printf("Stop signal sent to key2gestured (pid %ld)\n",
+                   (long)pid);
+            return 0;
+        }
+
+        if (errno != ESRCH) {
+            perror("kill SIGTERM");
+            return 1;
+        }
+    }
+
+    remove_runtime_files();
+    printf("key2gestured is not running\n");
     return 0;
 }
 
@@ -679,8 +891,20 @@ static int setup_keyboard(void)
     if (keyboard_device_path_overridden) {
         fd = open_input_path(keyboard_device_path);
     } else {
-        fd = open_named_input_device(KEYD_KEYBOARD_NAME, &keyboard_device_path);
-        if (fd < 0)
+        fd = open_input_path_if_named(DEFAULT_KEYBOARD_DEVICE,
+                                      KEYD_KEYBOARD_NAME,
+                                      &keyboard_device_path);
+        if (fd < 0) {
+            fd = open_input_path_if_named(FALLBACK_KEYBOARD_DEVICE,
+                                          KEYBOARD_DEVICE_NAME,
+                                          &keyboard_device_path);
+        }
+        if (fd < 0 && scan_input_devices) {
+            printf("Scanning input devices for keyboard source\n");
+            fd = open_named_input_device(KEYD_KEYBOARD_NAME,
+                                         &keyboard_device_path);
+        }
+        if (fd < 0 && scan_input_devices)
             fd = open_named_input_device(KEYBOARD_DEVICE_NAME,
                                          &keyboard_device_path);
         if (fd < 0)
@@ -989,10 +1213,18 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
         int poll_timeout = cfg_momentum_interval_ms < 8 ?
                            cfg_momentum_interval_ms : 8;
         int pret = poll(fds, nfds, poll_timeout);
+        int poll_errno = errno;
 
         if (pret < 0) {
-            if (errno == EINTR)
+            if (poll_errno == EINTR) {
+                if (reload_requested) {
+                    reload_requested = 0;
+                    reload_runtime_config();
+                }
                 continue;
+            }
+
+            errno = poll_errno;
             perror("poll");
             break;
         }
@@ -1045,7 +1277,8 @@ static void event_loop(struct libevdev *touch_dev, int touch_fd_raw)
         }
     }
 
-    end_injected_touch();
+    if (!shutdown_requested)
+        end_injected_touch();
 }
 
 /* ─── Entry point ─── */
@@ -1084,17 +1317,32 @@ static int setup_signal_handlers(void)
     return 0;
 }
 
+static int startup_should_stop(void)
+{
+    if (!running) {
+        remove_runtime_files();
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct libevdev *touch_dev = NULL;
     const char *env_touch_device;
     const char *env_keyboard_device;
 
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     if (argc > 1) {
         if (strcmp(argv[1], "reload") == 0)
             return send_reload_signal();
+        if (strcmp(argv[1], "stop") == 0)
+            return send_stop_signal();
 
-        fprintf(stderr, "Usage: %s [reload]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [reload|stop]\n", argv[0]);
         return 2;
     }
 
@@ -1113,14 +1361,24 @@ int main(int argc, char **argv)
         keyboard_device_path_overridden = 1;
     }
 
+    load_env_int("KEY2GESTURED_SCAN_INPUTS", &scan_input_devices, 0, 1);
+
     load_runtime_config_from_env();
     load_runtime_config_file("Loaded");
 
     printf("key2gestured v0.2 — Touch injection scrolling daemon\n");
     printf("====================================================\n\n");
 
+    unlink(READY_PATH);
+
+    if (startup_should_stop())
+        return 0;
+
     if (write_pid_file() < 0)
         return 1;
+
+    if (startup_should_stop())
+        return 0;
 
     /* Open touch device */
     int fd;
@@ -1128,23 +1386,43 @@ int main(int argc, char **argv)
     if (touch_device_path_overridden) {
         fd = open_input_path(touch_device_path);
     } else {
-        fd = open_named_input_device(TOUCH_DEVICE_NAME, &touch_device_path);
+        fd = open_input_path_if_named(DEFAULT_TOUCH_DEVICE,
+                                      TOUCH_DEVICE_NAME,
+                                      &touch_device_path);
+        if (fd < 0) {
+            printf("Default touch path %s not usable; trying fallback\n",
+                   DEFAULT_TOUCH_DEVICE);
+            fd = open_input_path_if_named(FALLBACK_TOUCH_DEVICE,
+                                          TOUCH_DEVICE_NAME,
+                                          &touch_device_path);
+        }
+        if (fd < 0 && scan_input_devices) {
+            printf("Scanning input devices for touch source\n");
+            fd = open_named_input_device(TOUCH_DEVICE_NAME,
+                                         &touch_device_path);
+        }
         if (fd < 0)
             fd = open_input_path(touch_device_path);
     }
 
+    if (startup_should_stop())
+        return 0;
+
     if (fd < 0) {
         perror("open touch device");
-        unlink(PID_PATH);
+        remove_runtime_files();
         return 1;
     }
 
     if (libevdev_new_from_fd(fd, &touch_dev) < 0) {
         fprintf(stderr, "Failed to init libevdev for touch\n");
         close(fd);
-        unlink(PID_PATH);
+        remove_runtime_files();
         return 1;
     }
+
+    if (startup_should_stop())
+        return 0;
 
     printf("Touch device: %s\n", libevdev_get_name(touch_dev));
     printf("  Path: %s\n", touch_device_path);
@@ -1156,9 +1434,15 @@ int main(int argc, char **argv)
         printf("  Grab: OK (exclusive access)\n");
     }
 
+    if (startup_should_stop())
+        return 0;
+
     /* Open keyboard for typing suppression */
     printf("\nKeyboard:\n");
     setup_keyboard();
+
+    if (startup_should_stop())
+        return 0;
 
     /* Setup uinput touch injection */
     printf("\nTouch injection:\n");
@@ -1168,9 +1452,12 @@ int main(int argc, char **argv)
         libevdev_grab(touch_dev, LIBEVDEV_UNGRAB);
         libevdev_free(touch_dev);
         close(fd);
-        unlink(PID_PATH);
+        remove_runtime_files();
         return 1;
     }
+
+    if (startup_should_stop())
+        return 0;
 
     printf("\nState machine:\n");
     printf("  Threshold: %d units\n", cfg_scroll_threshold);
@@ -1185,10 +1472,15 @@ int main(int argc, char **argv)
     printf("\nReady. Touch the keyboard touch surface to scroll.\n");
     printf("------------------------------------------\n");
 
+    if (write_ready_file() < 0) {
+        remove_runtime_files();
+        return 1;
+    }
+
     event_loop(touch_dev, fd);
 
     if (shutdown_requested) {
-        unlink(PID_PATH);
+        remove_runtime_files();
         return 0;
     }
 
@@ -1201,7 +1493,7 @@ int main(int argc, char **argv)
     libevdev_grab(touch_dev, LIBEVDEV_UNGRAB);
     libevdev_free(touch_dev);
     close(fd);
-    unlink(PID_PATH);
+    remove_runtime_files();
 
     return 0;
 }

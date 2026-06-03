@@ -27,9 +27,12 @@ Type=simple
 EnvironmentFile=-/etc/key2gestured/default.conf
 ExecStart=/usr/local/bin/key2gestured
 ExecReload=/usr/local/bin/key2gestured reload
+ExecStop=/usr/local/bin/key2gestured stop
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=10
+SuccessExitStatus=SIGTERM
+TimeoutStopSec=1
+KillMode=process
 
 # Must run as root to access /dev/input event devices and /dev/uinput.
 User=root

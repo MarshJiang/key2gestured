@@ -83,11 +83,16 @@ without restarting the daemon:
 sudo key2gestured reload
 ```
 
+Reload waits briefly for the daemon to finish startup. If the daemon is still
+opening input devices, retry after the `Ready. Touch the keyboard touch surface
+to scroll.` log line appears.
+
 Device path changes still require a restart because input devices must be
 closed and reopened.
 
-The service uses a finite stop timeout so shutdown does not hang indefinitely
-if an input device cleanup path stalls.
+The service uses a short stop timeout so shutdown does not hang indefinitely if
+an input device cleanup path stalls. `key2gestured stop` sends SIGTERM to the
+recorded daemon process and is used by the systemd unit.
 
 ### Install
 
@@ -127,25 +132,32 @@ Edit [`uinput.c`](uinput.c) only to change the virtual touch coordinate range:
 
 - `ABS_X_MAX` / `ABS_Y_MAX` — virtual touch coordinate range
 
-By default, key2gestured scans `/dev/input/event*` by libevdev device name:
+By default, key2gestured uses the known Droidian KEY2 event paths and verifies
+the libevdev device names:
 
-- touch source: `touch_keypad`
-- typing suppression: `keyd virtual keyboard`, falling back to `stmpe_keypad`
+- touch source: `/dev/input/by-path/platform-c175000.i2c-event`, falling back
+  to `/dev/input/event1`
+- typing suppression: `/dev/input/event7` for `keyd virtual keyboard`,
+  falling back to `/dev/input/event2` for `stmpe_keypad`
+
+Set `KEY2GESTURED_SCAN_INPUTS=1` to scan `/dev/input/event*` by name when event
+numbers differ on another installation.
 
 Device paths can also be overridden in `/etc/key2gestured/default.conf`:
 
 ```sh
 KEY2GESTURED_TOUCH_DEVICE=/dev/input/by-path/platform-c175000.i2c-event
 KEY2GESTURED_KEYBOARD_DEVICE=/dev/input/event7
+KEY2GESTURED_SCAN_INPUTS=0
 ```
 
 ## Device Paths
 
 | Device | Path | Role |
 |--------|------|------|
-| `touch_keypad` | auto-detected by name, fallback `/dev/input/by-path/platform-c175000.i2c-event` | Gesture source |
-| `keyd virtual keyboard` | auto-detected by name | Typing suppression after keyd remapping |
-| `stmpe_keypad` | auto-detected by name, fallback `/dev/input/event2` | Typing suppression without keyd |
+| `touch_keypad` | `/dev/input/by-path/platform-c175000.i2c-event`, fallback `/dev/input/event1` | Gesture source |
+| `keyd virtual keyboard` | `/dev/input/event7` | Typing suppression after keyd remapping |
+| `stmpe_keypad` | `/dev/input/event2` | Typing suppression without keyd |
 
 ## Files
 
